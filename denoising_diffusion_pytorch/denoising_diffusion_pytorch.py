@@ -626,6 +626,13 @@ class GaussianDiffusion(nn.Module):
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
     def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
+        if self.objective == 'score_matching':
+            """
+            Predict the score function from the model.
+            """
+            score_pred = self.model(x, t)
+            return score_pred
+        
         model_output = self.model(x, t, x_self_cond)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
@@ -730,9 +737,48 @@ class GaussianDiffusion(nn.Module):
         ret = self.unnormalize(ret)
         return ret
 
+    def update_img_with_score(self, img, score_pred, step_size=0.01, num_steps=10):
+        """
+        Update the image using Langevin dynamics based on the predicted score function.
+        
+        Args:
+            img (torch.Tensor): Input image tensor.
+            score_pred (torch.Tensor): Predicted score function from the model.
+            step_size (float): Step size for the Langevin dynamics updates.
+            num_steps (int): Number of Langevin dynamics steps.
+            
+        Returns:
+            torch.Tensor: Updated image tensor after applying Langevin dynamics.
+        """
+        batch_size = img.shape[0]
+        
+        for _ in range(num_steps):
+            noise = torch.randn_like(img)
+            grad = score_pred + step_size * noise
+            img = img + step_size * grad
+            
+            # Optional: Apply clipping or other constraints to the updated image
+            img = torch.clamp(img, -1.0, 1.0)
+            
+        return img
+
     @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
+        if self.objective == 'score_matching':
+            img = torch.randn((batch_size, channels, h, w), device=self.device)
+
+            # Iterate over timesteps in reverse order
+            for t in tqdm(reversed(range(self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+                score_pred = self.model_predictions(img, torch.full((batch_size,), t, device=self.device, dtype=torch.long))
+
+                # Update img using Langevin dynamics or an analogous MCMC method
+                # based on the predicted score function
+                img = self.update_img_with_score(img, score_pred)
+
+            img = self.unnormalize(img)
+            return img
+        
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
 
@@ -765,6 +811,17 @@ class GaussianDiffusion(nn.Module):
             extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape) * noise
         )
 
+    def q_score_function(self, x_start, t):
+        """
+        Compute the true score function of the perturbed distribution q(x_t | x_0).
+        """
+        alpha_t = extract(self.alphas_cumprod, t, x_start.shape)
+        sqrt_alpha_t = extract(self.sqrt_alphas_cumprod, t, x_start.shape)
+        sqrt_one_minus_alpha_t = extract(self.sqrt_one_minus_alphas_cumprod, t, x_start.shape)
+
+        score_true = -sqrt_one_minus_alpha_t / sqrt_alpha_t * x_start
+        return score_true
+    
     def p_losses(self, x_start, t, noise = None, offset_noise_strength = None):
         b, c, h, w = x_start.shape
 
@@ -781,6 +838,16 @@ class GaussianDiffusion(nn.Module):
         # noise sample
 
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
+        
+        if self.objective == 'score_matching':
+            score_pred = self.model_predictions(x, t)
+            score_true = self.q_score_function(x_start, t)
+
+            loss = 1/2 * F.mse_loss(score_pred, score_true, reduction='none')
+            loss = reduce(loss, 'b ... -> b', 'mean')
+
+            return loss.mean()
+        
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
         # and condition with unet with that
