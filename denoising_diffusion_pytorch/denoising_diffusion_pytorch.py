@@ -1,5 +1,6 @@
 import math
 import copy
+import datetime
 from pathlib import Path
 from random import random
 from functools import partial
@@ -11,6 +12,7 @@ from torch import nn, einsum
 from torch.cuda.amp import autocast
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
 
 from torch.optim import Adam
 
@@ -992,8 +994,13 @@ class Trainer(object):
     ):
         super().__init__()
 
-        # accelerator
+        current_time = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
+        # Create a TensorBoard summary writer with a timestamped log directory
+        log_dir = f'logs/run_{current_time}'
+        self.tf_writter = SummaryWriter(log_dir)
+
+        # accelerator
         self.accelerator = Accelerator(
             split_batches = split_batches,
             mixed_precision = mixed_precision_type if amp else 'no'
@@ -1145,7 +1152,7 @@ class Trainer(object):
                     self.accelerator.backward(loss)
 
                 pbar.set_description(f'loss: {total_loss:.4f}')
-
+                self.tf_writter.add_scalar('p_loss', total_loss, global_step=self.step)
                 accelerator.wait_for_everyone()
                 accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
@@ -1186,3 +1193,4 @@ class Trainer(object):
                 pbar.update(1)
 
         accelerator.print('training complete')
+        self.tf_writter.close()
