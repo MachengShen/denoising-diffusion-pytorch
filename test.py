@@ -1,5 +1,5 @@
 import torch
-from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer
+from denoising_diffusion_pytorch import Unet, GaussianDiffusion, Trainer, RepresentationEncoder
 
 def save_images(imgs):
     import torchvision
@@ -15,21 +15,35 @@ def save_images(imgs):
 
     print('Images saved successfully.')
 
+image_size = 32
+objective = 'representation_learning'
+latent_code_dim = 128 if objective == 'representation_learning' else 0
 model = Unet(
     dim = 64,
     dim_mults = (1, 2, 4, 8),
-    flash_attn = False
+    flash_attn = False,
+    latent_code_dim=latent_code_dim,
 )
+
+if objective == 'representation_learning':
+    representation_encoder = RepresentationEncoder(image_size = image_size,
+                                                   latent_dim = latent_code_dim,)
+else: 
+    representation_encoder = None
 
 diffusion = GaussianDiffusion(
     model,
-    image_size = 32,
+    image_size = image_size,
     timesteps = 1000,    # number of steps
-    objective = 'score_matching',
+    objective = objective,
+    representation_encoder=representation_encoder
 )
 
-# path_to_img = '/Users/macheng/CIFAR-10-images-master/train/'
-path_to_img = '/root/CIFAR-10-images-master/train/'
+training_images = torch.rand(8, 3, image_size, image_size) # images are normalized from 0 to 1
+loss = diffusion(training_images)
+
+path_to_img = '/Users/macheng/CIFAR-10-images-master/train/'
+# path_to_img = '/root/CIFAR-10-images-master/train/'
 
 trainer = Trainer(
     diffusion,

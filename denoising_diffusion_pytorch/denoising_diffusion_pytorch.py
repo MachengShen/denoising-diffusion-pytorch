@@ -16,6 +16,8 @@ from torch.optim import Adam
 
 from torchvision import transforms as T, utils
 
+from vit_pytorch import ViT
+
 from einops import rearrange, reduce, repeat
 from einops.layers.torch import Rearrange
 
@@ -287,7 +289,8 @@ class Unet(nn.Module):
         attn_dim_head = 32,
         attn_heads = 4,
         full_attn = None,    # defaults to full attention only for inner most layer
-        flash_attn = False
+        flash_attn = False,
+        latent_code_dim = 0, # latent code for diffusion-based representation learning
     ):
         super().__init__()
 
@@ -349,18 +352,18 @@ class Unet(nn.Module):
             is_last = ind >= (num_resolutions - 1)
 
             attn_klass = FullAttention if layer_full_attn else LinearAttention
-
+            # for diffusion-based representation learning, we share the info channel between time_emb and latent code
             self.downs.append(nn.ModuleList([
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
-                block_klass(dim_in, dim_in, time_emb_dim = time_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim + latent_code_dim),
+                block_klass(dim_in, dim_in, time_emb_dim = time_dim + latent_code_dim),
                 attn_klass(dim_in, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
                 Downsample(dim_in, dim_out) if not is_last else nn.Conv2d(dim_in, dim_out, 3, padding = 1)
             ]))
 
         mid_dim = dims[-1]
-        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_block1 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim + latent_code_dim)
         self.mid_attn = FullAttention(mid_dim, heads = attn_heads[-1], dim_head = attn_dim_head[-1])
-        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim)
+        self.mid_block2 = block_klass(mid_dim, mid_dim, time_emb_dim = time_dim + latent_code_dim)
 
         for ind, ((dim_in, dim_out), layer_full_attn, layer_attn_heads, layer_attn_dim_head) in enumerate(zip(*map(reversed, (in_out, full_attn, attn_heads, attn_dim_head)))):
             is_last = ind == (len(in_out) - 1)
@@ -368,8 +371,8 @@ class Unet(nn.Module):
             attn_klass = FullAttention if layer_full_attn else LinearAttention
 
             self.ups.append(nn.ModuleList([
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
-                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim),
+                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim + latent_code_dim),
+                block_klass(dim_out + dim_in, dim_out, time_emb_dim = time_dim + latent_code_dim),
                 attn_klass(dim_out, dim_head = layer_attn_dim_head, heads = layer_attn_heads),
                 Upsample(dim_out, dim_in) if not is_last else  nn.Conv2d(dim_out, dim_in, 3, padding = 1)
             ]))
@@ -377,14 +380,14 @@ class Unet(nn.Module):
         default_out_dim = channels * (1 if not learned_variance else 2)
         self.out_dim = default(out_dim, default_out_dim)
 
-        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim)
+        self.final_res_block = block_klass(dim * 2, dim, time_emb_dim = time_dim + latent_code_dim)
         self.final_conv = nn.Conv2d(dim, self.out_dim, 1)
 
     @property
     def downsample_factor(self):
         return 2 ** (len(self.downs) - 1)
 
-    def forward(self, x, time, x_self_cond = None):
+    def forward(self, x, time, x_self_cond = None, latent_code = None):
         assert all([divisible_by(d, self.downsample_factor) for d in x.shape[-2:]]), f'your input dimensions {x.shape[-2:]} need to be divisible by {self.downsample_factor}, given the unet'
 
         if self.self_condition:
@@ -395,6 +398,10 @@ class Unet(nn.Module):
         r = x.clone()
 
         t = self.time_mlp(time)
+        
+        # append latent_code to t
+        if latent_code is not None:
+            t = torch.cat([t, latent_code], dim = -1)
 
         h = []
 
@@ -426,6 +433,31 @@ class Unet(nn.Module):
 
         x = self.final_res_block(x, t)
         return self.final_conv(x)
+
+
+class RepresentationEncoder(nn.Module):
+    def __init__(
+        self,
+        image_size,
+        latent_dim,
+        patch_size = 32,
+        hidden_dim = 1024,
+        depth = 6,
+        attn_heads = 16,
+    ):
+        super().__init__()
+        self._vit = ViT(image_size = image_size,
+                        patch_size = patch_size,
+                        num_classes = latent_dim,
+                        dim = hidden_dim,
+                        depth = depth,
+                        heads = attn_heads,
+                        mlp_dim = 2048,
+                        dropout = 0.1,
+                        emb_dropout = 0.1)
+    
+    def forward(self, input):
+        return self._vit(input)
 
 # gaussian diffusion trainer class
 
@@ -476,6 +508,7 @@ class GaussianDiffusion(nn.Module):
         model,
         *,
         image_size,
+        representation_encoder = None, 
         timesteps = 1000,
         sampling_timesteps = None,
         objective = 'pred_v',
@@ -492,7 +525,9 @@ class GaussianDiffusion(nn.Module):
         assert not hasattr(model, 'random_or_learned_sinusoidal_cond') or not model.random_or_learned_sinusoidal_cond
 
         self.model = model
-
+        self.representation_encoder = representation_encoder
+        if not objective == 'representation_learning':
+            assert self.representation_encoder is None
         self.channels = self.model.channels
         self.self_condition = self.model.self_condition
 
@@ -503,7 +538,7 @@ class GaussianDiffusion(nn.Module):
 
         self.objective = objective
 
-        assert objective in {'pred_noise', 'pred_x0', 'pred_v', 'score_matching'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
+        assert objective in {'pred_noise', 'pred_x0', 'pred_v', 'representation_learning'}, 'objective must be either pred_noise (predict noise) or pred_x0 (predict image start) or pred_v (predict v [v-parameterization as defined in appendix D of progressive distillation paper, used in imagen-video successfully])'
 
         if beta_schedule == 'linear':
             beta_schedule_fn = linear_beta_schedule
@@ -576,7 +611,7 @@ class GaussianDiffusion(nn.Module):
         if min_snr_loss_weight:
             maybe_clipped_snr.clamp_(max = min_snr_gamma)
 
-        if objective == 'pred_noise':
+        if objective in ['pred_noise', 'representation_learning']:
             register_buffer('loss_weight', maybe_clipped_snr / snr)
         elif objective == 'pred_x0':
             register_buffer('loss_weight', maybe_clipped_snr)
@@ -625,15 +660,15 @@ class GaussianDiffusion(nn.Module):
         posterior_log_variance_clipped = extract(self.posterior_log_variance_clipped, t, x_t.shape)
         return posterior_mean, posterior_variance, posterior_log_variance_clipped
 
-    def model_predictions(self, x, t, x_self_cond = None, clip_x_start = False, rederive_pred_noise = False):
-        if self.objective == 'score_matching':
-            """
-            Predict the score function from the model.
-            """
-            score_pred = self.model(x, t)
-            return score_pred
+    def model_predictions(self, x, t, x_self_cond = None, latent_code = None, clip_x_start = False, rederive_pred_noise = False):
+        # if self.objective == 'score_matching':
+        #     """
+        #     Predict the score function from the model.
+        #     """
+        #     score_pred = self.model(x, t)
+        #     return score_pred
         
-        model_output = self.model(x, t, x_self_cond)
+        model_output = self.model(x, t, x_self_cond, latent_code = latent_code)
         maybe_clip = partial(torch.clamp, min = -1., max = 1.) if clip_x_start else identity
 
         if self.objective == 'pred_noise':
@@ -657,8 +692,8 @@ class GaussianDiffusion(nn.Module):
 
         return ModelPrediction(pred_noise, x_start)
 
-    def p_mean_variance(self, x, t, x_self_cond = None, clip_denoised = True):
-        preds = self.model_predictions(x, t, x_self_cond)
+    def p_mean_variance(self, x, t, x_self_cond = None, latent_code = None, clip_denoised = True):
+        preds = self.model_predictions(x, t, x_self_cond, latent_code = latent_code)
         x_start = preds.pred_x_start
 
         if clip_denoised:
@@ -668,16 +703,16 @@ class GaussianDiffusion(nn.Module):
         return model_mean, posterior_variance, posterior_log_variance, x_start
 
     @torch.inference_mode()
-    def p_sample(self, x, t: int, x_self_cond = None):
+    def p_sample(self, x, t: int, x_self_cond = None, latent_code = None):
         b, *_, device = *x.shape, self.device
         batched_times = torch.full((b,), t, device = device, dtype = torch.long)
-        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, x_self_cond = x_self_cond, clip_denoised = True)
+        model_mean, _, model_log_variance, x_start = self.p_mean_variance(x = x, t = batched_times, latent_code = latent_code, x_self_cond = x_self_cond, clip_denoised = True)
         noise = torch.randn_like(x) if t > 0 else 0. # no noise if t == 0
         pred_img = model_mean + (0.5 * model_log_variance).exp() * noise
         return pred_img, x_start
 
     @torch.inference_mode()
-    def p_sample_loop(self, shape, return_all_timesteps = False):
+    def p_sample_loop(self, shape, return_all_timesteps = False, latent_code = None):
         batch, device = shape[0], self.device
 
         img = torch.randn(shape, device = device)
@@ -687,7 +722,7 @@ class GaussianDiffusion(nn.Module):
 
         for t in tqdm(reversed(range(0, self.num_timesteps)), desc = 'sampling loop time step', total = self.num_timesteps):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, t, self_cond)
+            img, x_start = self.p_sample(img, t, self_cond, latent_code = latent_code)
             imgs.append(img)
 
         ret = img if not return_all_timesteps else torch.stack(imgs, dim = 1)
@@ -765,25 +800,25 @@ class GaussianDiffusion(nn.Module):
     @torch.inference_mode()
     def sample(self, batch_size = 16, return_all_timesteps = False):
         (h, w), channels = self.image_size, self.channels
-        if self.objective == 'score_matching':
-            img = torch.randn((batch_size, channels, h, w), device=self.device)
+        # if self.objective == 'score_matching':
+        #     img = torch.randn((batch_size, channels, h, w), device=self.device)
 
-            # Iterate over timesteps in reverse order
-            for t in tqdm(reversed(range(self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
-                score_pred = self.model_predictions(img, torch.full((batch_size,), t, device=self.device, dtype=torch.long))
+        #     # Iterate over timesteps in reverse order
+        #     for t in tqdm(reversed(range(self.num_timesteps)), desc='sampling loop time step', total=self.num_timesteps):
+        #         score_pred = self.model_predictions(img, torch.full((batch_size,), t, device=self.device, dtype=torch.long))
 
-                # Update img using Langevin dynamics or an analogous MCMC method
-                # based on the predicted score function
-                img = self.update_img_with_score(img, score_pred)
+        #         # Update img using Langevin dynamics or an analogous MCMC method
+        #         # based on the predicted score function
+        #         img = self.update_img_with_score(img, score_pred)
 
-            img = self.unnormalize(img)
-            return img
+        #     img = self.unnormalize(img)
+        #     return img
         
         sample_fn = self.p_sample_loop if not self.is_ddim_sampling else self.ddim_sample
         return sample_fn((batch_size, channels, h, w), return_all_timesteps = return_all_timesteps)
 
     @torch.inference_mode()
-    def interpolate(self, x1, x2, t = None, lam = 0.5):
+    def interpolate(self, x1, x2, t = None, lam = 0.5, latent_code = None):
         b, *_, device = *x1.shape, x1.device
         t = default(t, self.num_timesteps - 1)
 
@@ -798,7 +833,7 @@ class GaussianDiffusion(nn.Module):
 
         for i in tqdm(reversed(range(0, t)), desc = 'interpolation sample time step', total = t):
             self_cond = x_start if self.self_condition else None
-            img, x_start = self.p_sample(img, i, self_cond)
+            img, x_start = self.p_sample(img, i, self_cond, latent_code = latent_code)
 
         return img
 
@@ -839,14 +874,14 @@ class GaussianDiffusion(nn.Module):
 
         x = self.q_sample(x_start = x_start, t = t, noise = noise)
         
-        if self.objective == 'score_matching':
-            score_pred = self.model_predictions(x, t)
-            score_true = self.q_score_function(x_start, t)
+        # if self.objective == 'score_matching':
+        #     score_pred = self.model_predictions(x, t)
+        #     score_true = self.q_score_function(x_start, t)
 
-            loss = 1/2 * F.mse_loss(score_pred, score_true, reduction='none')
-            loss = reduce(loss, 'b ... -> b', 'mean')
+        #     loss = 1/2 * F.mse_loss(score_pred, score_true, reduction='none')
+        #     loss = reduce(loss, 'b ... -> b', 'mean')
 
-            return loss.mean()
+        #     return loss.mean()
         
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -854,6 +889,7 @@ class GaussianDiffusion(nn.Module):
         # this technique will slow down training by 25%, but seems to lower FID significantly
 
         x_self_cond = None
+        assert not self.self_condition # make sure model_predictions() is not called
         if self.self_condition and random() < 0.5:
             with torch.no_grad():
                 x_self_cond = self.model_predictions(x, t).pred_x_start
@@ -861,9 +897,13 @@ class GaussianDiffusion(nn.Module):
 
         # predict and take gradient step
 
-        model_out = self.model(x, t, x_self_cond)
+        if self.objective == 'representation_learning':
+            latent_code = self.representation_encoder(x_start)
+        else:
+            latent_code = None
+        model_out = self.model(x, t, x_self_cond, latent_code = latent_code)
 
-        if self.objective == 'pred_noise':
+        if self.objective in ['pred_noise', 'representation_learning']:
             target = noise
         elif self.objective == 'pred_x0':
             target = x_start
