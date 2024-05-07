@@ -25,7 +25,9 @@ setup(
     'pytorch-fid',
     'torch',
     'torchvision',
-    'tqdm'
+    'tqdm',
+    'vit-pytorch',
+    'tensorboard',
   ],
   classifiers=[
     'Development Status :: 4 - Beta',

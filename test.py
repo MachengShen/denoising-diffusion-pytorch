@@ -17,6 +17,8 @@ def save_images(imgs):
 
 image_size = 32
 objective = 'representation_learning'
+train_num_steps = 100000
+save_and_sample_every = train_num_steps + 1 if objective == 'representation_learning' else 10000 
 latent_code_dim = 128 if objective == 'representation_learning' else 0
 model = Unet(
     dim = 64,
@@ -50,9 +52,9 @@ trainer = Trainer(
     path_to_img,
     train_batch_size = 64,
     train_lr = 10e-5,
-    train_num_steps = 100000,         # total training steps 7e5
+    train_num_steps = train_num_steps,         # total training steps 7e5
     gradient_accumulate_every = 2,    # gradient accumulation steps
-    save_and_sample_every = 10000,
+    save_and_sample_every = save_and_sample_every,
     ema_decay = 0.995,                # exponential moving average decay
     amp = True,                       # turn on mixed precision
     calculate_fid = False              # whether to calculate fid during training
@@ -60,11 +62,12 @@ trainer = Trainer(
 
 trainer.train()
 
-print("-----------------training complete---------------")
-sampled_images = diffusion.sample(batch_size = 4)
-print(sampled_images.shape) # (4, 3, 128, 128)
+if not objective == 'representation_learning':
+    print("-----------------training complete---------------")
+    sampled_images = diffusion.sample(batch_size = 4)
+    print(sampled_images.shape) # (4, 3, 128, 128)
 
-save_images(sampled_images)
+    save_images(sampled_images)
 
 
 
