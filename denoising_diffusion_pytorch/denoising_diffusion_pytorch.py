@@ -973,7 +973,7 @@ class Trainer(object):
         *,
         train_batch_size = 16,
         gradient_accumulate_every = 1,
-        augment_horizontal_flip = True,
+        augment_horizontal_flip = False,
         train_lr = 1e-4,
         train_num_steps = 100000,
         ema_update_every = 10,
@@ -990,7 +990,8 @@ class Trainer(object):
         inception_block_idx = 2048,
         max_grad_norm = 1.,
         num_fid_samples = 50000,
-        save_best_and_latest_only = False
+        save_best_and_latest_only = False,
+        save_encoder_every = 10000,
     ):
         super().__init__()
 
@@ -1022,6 +1023,7 @@ class Trainer(object):
         assert has_int_squareroot(num_samples), 'number of samples must have an integer square root'
         self.num_samples = num_samples
         self.save_and_sample_every = save_and_sample_every
+        self.save_encoder_every = save_encoder_every
 
         self.batch_size = train_batch_size
         self.gradient_accumulate_every = gradient_accumulate_every
@@ -1165,6 +1167,9 @@ class Trainer(object):
                 if accelerator.is_main_process:
                     self.ema.update()
 
+                    if self.step != 0 and divisible_by(self.step, self.save_encoder_every) and self.model.objective == 'representation_learning':
+                        torch.save(self.model.representation_encoder, f'representation_encoder_{self.step}.pth')
+                        
                     if self.step != 0 and divisible_by(self.step, self.save_and_sample_every):
                         self.ema.ema_model.eval()
 
