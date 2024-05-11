@@ -87,6 +87,7 @@ if __name__ == '__main__':
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
     encoder = torch.load('representation_encoder_100000.pth')
+    encoder.eval()
     # Training loop
     num_epochs = 10
     for epoch in range(num_epochs):

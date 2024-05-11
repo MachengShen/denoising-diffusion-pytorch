@@ -57,7 +57,8 @@ trainer = Trainer(
     save_and_sample_every = save_and_sample_every,
     ema_decay = 0.995,                # exponential moving average decay
     amp = True,                       # turn on mixed precision
-    calculate_fid = False              # whether to calculate fid during training
+    calculate_fid = False,              # whether to calculate fid during training
+    save_encoder_every= 50000,
 )
 
 trainer.train()
