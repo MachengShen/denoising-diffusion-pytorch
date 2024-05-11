@@ -504,6 +504,13 @@ def sigmoid_beta_schedule(timesteps, start = -3, end = 3, tau = 1, clamp_min = 1
     betas = 1 - (alphas_cumprod[1:] / alphas_cumprod[:-1])
     return torch.clip(betas, 0, 0.999)
 
+def SMLD_sigma_schedule(timesteps, sigma_min = 0.01, sigma_max = 50):
+    return torch.exp(torch.linspace(
+        torch.log(torch.tensor(sigma_min, requires_grad=False)),
+        torch.log(torch.tensor(sigma_max, requires_grad=False)),
+        timesteps,
+        ))
+
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -552,7 +559,10 @@ class GaussianDiffusion(nn.Module):
             raise ValueError(f'unknown beta schedule {beta_schedule}')
 
         betas = beta_schedule_fn(timesteps, **schedule_fn_kwargs)
-
+        
+        # for score-matching
+        sigmas = SMLD_sigma_schedule(timesteps)
+        
         alphas = 1. - betas
         alphas_cumprod = torch.cumprod(alphas, dim=0)
         alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value = 1.)
@@ -572,6 +582,8 @@ class GaussianDiffusion(nn.Module):
 
         register_buffer = lambda name, val: self.register_buffer(name, val.to(torch.float32))
 
+        register_buffer('sigmas', sigmas)
+        register_buffer('one_over_sigmas2', 1. / (sigmas ** 2))
         register_buffer('betas', betas)
         register_buffer('alphas_cumprod', alphas_cumprod)
         register_buffer('alphas_cumprod_prev', alphas_cumprod_prev)
@@ -691,6 +703,8 @@ class GaussianDiffusion(nn.Module):
             x_start = self.predict_start_from_v(x, t, v)
             x_start = maybe_clip(x_start)
             pred_noise = self.predict_noise_from_start(x, t, x_start)
+        else:
+            raise Exception("unsupported objective")
 
         return ModelPrediction(pred_noise, x_start)
 
@@ -874,16 +888,10 @@ class GaussianDiffusion(nn.Module):
 
         # noise sample
 
-        x = self.q_sample(x_start = x_start, t = t, noise = noise)
-        
-        # if self.objective == 'score_matching':
-        #     score_pred = self.model_predictions(x, t)
-        #     score_true = self.q_score_function(x_start, t)
-
-        #     loss = 1/2 * F.mse_loss(score_pred, score_true, reduction='none')
-        #     loss = reduce(loss, 'b ... -> b', 'mean')
-
-        #     return loss.mean()
+        if self.objective == 'representation_learning':
+            x = x_start + extract(self.sigmas, t, x_start.shape) * noise
+        else:
+            x = self.q_sample(x_start = x_start, t = t, noise = noise)
         
 
         # if doing self-conditioning, 50% of the time, predict x_start from current set of times
@@ -905,8 +913,11 @@ class GaussianDiffusion(nn.Module):
             latent_code = None
         model_out = self.model(x, t, x_self_cond, latent_code = latent_code)
 
-        if self.objective in ['pred_noise', 'representation_learning']:
+        if self.objective == 'pred_noise':
             target = noise
+        elif self.objective == 'representation_learning':
+            # target is the score, so opposite to the noise direction
+            target = -noise * extract(self.one_over_sigmas2, t, x.shape)
         elif self.objective == 'pred_x0':
             target = x_start
         elif self.objective == 'pred_v':
@@ -917,8 +928,12 @@ class GaussianDiffusion(nn.Module):
 
         loss = F.mse_loss(model_out, target, reduction = 'none')
         loss = reduce(loss, 'b ... -> b', 'mean')
-
-        loss = loss * extract(self.loss_weight, t, loss.shape)
+        
+        if self.objective == 'representation_learning':
+            # weight function lambda
+            loss = loss * extract(self.sigmas, t, loss.shape) ** 2
+        else:
+            loss = loss * extract(self.loss_weight, t, loss.shape)
         return loss.mean()
 
     def forward(self, img, *args, **kwargs):
@@ -991,7 +1006,7 @@ class Trainer(object):
         max_grad_norm = 1.,
         num_fid_samples = 50000,
         save_best_and_latest_only = False,
-        save_encoder_every = 10000,
+        save_encoder_every = 50000,
     ):
         super().__init__()
 
