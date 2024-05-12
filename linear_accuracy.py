@@ -13,13 +13,18 @@ from PIL import Image
 from denoising_diffusion_pytorch.denoising_diffusion_pytorch import convert_image_to_fn, exists
 
 class LinearModel(nn.Module):
-    def __init__(self, feature_dim = 128):
+    def __init__(self, feature_dim = 128, hidden_dim = 128):
         super(LinearModel, self).__init__()
-        self.linear = nn.Linear(feature_dim, 10)  # 3072 for flattened 32x32x3 images, 10 for CIFAR-10 classes
+        self.fc1 = nn.Linear(feature_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, 10)
+        self.relu = nn.ReLU()
+        # self.linear = nn.Linear(feature_dim, 10) 
 
     def forward(self, x):
-        x = self.linear(x)
-        return x
+        out = self.fc1(x)
+        out = self.relu(out)
+        out = self.fc2(out)
+        return out
         
 class LabeledCifarDataset(Dataset):
     def __init__(
@@ -86,10 +91,10 @@ if __name__ == '__main__':
     # Define the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
-    encoder = torch.load('representation_encoder_100000.pth')
+    encoder = torch.load('representation_encoder_200000.pth')
     encoder.eval()
     # Training loop
-    num_epochs = 10
+    num_epochs = 100
     for epoch in range(num_epochs):
         running_loss = 0.0
         for inputs, labels in dl:
